@@ -207,8 +207,8 @@ Cloudflare 的 `request.cf.asn` 能拿到访问者所属运营商，于是节点
 GET /p/BV1x?qn=64
   ├─ 有 ?h= / ?i=          → 听你的（带 remember=1 则记下来）      manual
   ├─ KV 有 cdn:asn:<asn>   → 直接用记下的节点                    asn
-  ├─ 没记过 → 从边缘 colo 并行探 6 个候选（Range 1 字节）
-  │            → 记下最快的 6 小时                               probe
+  ├─ 没记过 → 先按默认节点 302，探测丢到 waitUntil 后台跑
+  │            → 记下最快的 6 小时（下次同 ASN 命中）            default + Learning:1
   └─ 全部不可达 → 用上游原始节点，负缓存 15 分钟                  default
 ```
 
@@ -255,6 +255,14 @@ Worker：校验 hw 是该直链的合法候选 → 写 cdn:asn:<访问者的 ASN
 
 - 键：`cdn:asn:<asn>`（KV 或 Cache API），TTL 6 小时，之后重新学（运营商路由会变）
 - 成本：每个新 ASN 只多 6 个 1 字节请求 + 1 次 KV 写，之后零开销；视频流量仍然 0
+- **延迟**：Worker 里探测不占请求路径（`ctx.waitUntil`），302 立刻返回；
+  该次响应头带 `X-Bili-Cdn-Learning: 1`，下一次同 ASN 请求才变成 `source: asn`
+- **探测策略 = first-ok + 150ms 收尾**：第一个节点成功后只再等 `graceMs=150`，
+  让同时到达的结果进排名，然后中止其余请求。黑洞节点不会再拖满 `PROBE_TIMEOUT_MS=1500`
+  （实测：30ms 出冠军 → 约 180ms 收工；一个都没成功时才用满 1.5s）
+- `GET /json?probe=1` 用 `settle: 'all'`，仍返回**完整**排名（含失败/超时/错误），只是慢一点
+- 拿不到 `waitUntil` 的自建环境同步等待时同样走 first-ok，典型 ~180ms
+- 书签端（`probeInPage`）也是 first-ok：浏览器挑节点同样不会被某个挂掉的镜像拖到 2s
 - 手动教一次：
 
 ```bash

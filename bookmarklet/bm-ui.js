@@ -172,7 +172,7 @@ function boot() {
     var urls = d.urls && d.urls.length ? d.urls : cdnCandidates(d.url);
     if (!urls || urls.length < 2) return Promise.resolve(d);
     say('按你的网络挑最快的 CDN 节点…');
-    return probeInPage(urls)
+    return probeInPage(urls, { settle: 'first-ok', graceMs: 150 })
       .then(function (ranked) {
         var best = (ranked || []).filter(function (r) {
           return r.ok;

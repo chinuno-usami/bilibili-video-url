@@ -29,37 +29,101 @@ export { CDN_MIRRORS, cdnCandidates, cdnTagOf, selectCandidate } from './cdn.mjs
  * 注意：这不是访问者视角，只能用来区分「签名/防盗链问题」和「网络/节点问题」。
  * 访问者的真实网络请用浏览器端 probeInPage。
  */
-export async function probeCandidates(urls, fetchImpl = fetch, { timeoutMs = 3000 } = {}) {
-  const signal =
-    typeof AbortSignal !== 'undefined' && AbortSignal.timeout
-      ? AbortSignal.timeout(timeoutMs)
-      : undefined;
-  const one = async (c) => {
+/**
+ * 从服务端（Worker 边缘 / 本机）探各候选是否可达：Range 1 字节。
+ * 注意：这不是访问者视角，只能用来区分「签名/防盗链问题」和「网络/节点问题」。
+ * 访问者的真实网络请用浏览器端 probeInPage。
+ *
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs] 单个候选的放弃期限
+ * @param {'all'|'first-ok'} [opts.settle]
+ *   - `all`（默认）：等所有候选落地，返回完整排名（诊断用）
+ *   - `first-ok`：第一个成功返回后再等 `graceMs` 收尾，然后中止其余请求。
+ *     返回的数组是**部分**排名（没等到的候选不在里面）。
+ * @param {number} [opts.graceMs] `first-ok` 模式下首个成功后的收尾窗口
+ */
+export async function probeCandidates(urls, fetchImpl = fetch, opts = {}) {
+  const { timeoutMs = 3000, graceMs = 0 } = opts;
+  const settle = String(opts.settle || 'all').toLowerCase();
+  const firstOkMode = settle === 'first-ok' || settle === 'firstok';
+
+  const results = new Array(urls.length);
+  const ctrls = new Array(urls.length);
+  const timers = new Array(urls.length);
+  let done = 0;
+  let sawOk = false;
+  let earlyTimer = null;
+
+  let resolveEarly = null;
+  const early = firstOkMode ? new Promise((r) => { resolveEarly = r; }) : null;
+
+  const one = (c, i) => {
+    const ctrl = new AbortController();
     const started = Date.now();
-    try {
-      const res = await fetchImpl(c.url, {
-        method: 'GET',
-        headers: { ...BROWSER_HEADERS, Range: 'bytes=0-0' },
-        signal,
-      });
-      const ms = Date.now() - started;
-      try {
-        if (res.body && res.body.cancel) await res.body.cancel();
-      } catch {}
-      return { tag: c.tag, host: c.host, status: res.status, ok: res.status === 200 || res.status === 206, ms };
-    } catch (err) {
-      return {
-        tag: c.tag,
-        host: c.host,
-        status: 0,
-        ok: false,
-        ms: Date.now() - started,
-        error: String((err && err.message) || err),
-      };
-    }
+    ctrls[i] = ctrl;
+    timers[i] = setTimeout(() => ctrl.abort(), timeoutMs);
+
+    const finish = (r) => {
+      clearTimeout(timers[i]);
+      results[i] = r;
+      done++;
+      if (r.ok && !sawOk) {
+        sawOk = true;
+        if (early) {
+          if (graceMs > 0) earlyTimer = setTimeout(resolveEarly, graceMs);
+          else resolveEarly();
+        }
+      }
+      return r;
+    };
+
+    return fetchImpl(c.url, {
+      method: 'GET',
+      headers: { ...BROWSER_HEADERS, Range: 'bytes=0-0' },
+      signal: ctrl.signal,
+    }).then(
+      async (res) => {
+        const ms = Date.now() - started;
+        const ok = res.status === 200 || res.status === 206;
+        try {
+          if (res.body && res.body.cancel) await res.body.cancel();
+        } catch {}
+        return finish({ tag: c.tag, host: c.host, status: res.status, ok, ms });
+      },
+      (err) =>
+        finish({
+          tag: c.tag,
+          host: c.host,
+          status: 0,
+          ok: false,
+          ms: Date.now() - started,
+          error: String((err && err.message) || err),
+        })
+    );
   };
-  const all = await Promise.all(urls.map(one));
-  return all.sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms);
+
+  const all = Promise.all(urls.map(one));
+  all.catch(() => {}); // 提前返回后剩下的拒绝不该冒泡成 unhandled
+
+  if (early) {
+    await Promise.race([all, early]);
+    if (earlyTimer) {
+      clearTimeout(earlyTimer);
+      earlyTimer = null;
+    }
+    // 还在飞的候选：直接掐掉，别再占着连接
+    for (let i = 0; i < urls.length; i++) {
+      if (!results[i]) {
+        clearTimeout(timers[i]);
+        ctrls[i].abort();
+      }
+    }
+  } else {
+    await all;
+  }
+
+  const settled = results.filter(Boolean);
+  return settled.sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms);
 }
 
 const BV_RE = /(BV[0-9A-Za-z]{10})/;

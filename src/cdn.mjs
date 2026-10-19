@@ -82,18 +82,39 @@ export async function probeInPage(urls, opts) {
   const o = opts || {};
   const list = Array.isArray(urls) ? urls : [];
   const timeoutMs = Number(o.timeoutMs) || 2000;
+  const graceMs = Number(o.graceMs) || 0;
+  const settle = String(o.settle || 'all').toLowerCase();
+  const firstOkMode = settle === 'first-ok' || settle === 'firstok';
   const doFetch = o.fetchImpl || fetch;
 
-  const one = (c) => {
+  const results = new Array(list.length);
+  const ctrls = new Array(list.length);
+  const timers = new Array(list.length);
+  let done = 0;
+  let sawOk = false;
+  let earlyTimer = null;
+  let resolveEarly = null;
+  const early = firstOkMode ? new Promise((r) => { resolveEarly = r; }) : null;
+
+  const one = (c, i) => {
     const started = Date.now();
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = setTimeout(() => {
-      if (ctrl) ctrl.abort();
-    }, timeoutMs);
-    const done = (ok, err) => {
-      clearTimeout(timer);
-      return { tag: c.tag, host: c.host, url: c.url, ok, ms: Date.now() - started, error: err || '' };
+    ctrls[i] = ctrl;
+    if (ctrl) timers[i] = setTimeout(() => ctrl.abort(), timeoutMs);
+
+    const finish = (ok, err) => {
+      clearTimeout(timers[i]);
+      results[i] = { tag: c.tag, host: c.host, url: c.url, ok, ms: Date.now() - started, error: err || '' };
+      done++;
+      if (ok && !sawOk) {
+        sawOk = true;
+        if (early) {
+          if (graceMs > 0) earlyTimer = setTimeout(resolveEarly, graceMs);
+          else resolveEarly();
+        }
+      }
     };
+
     try {
       return doFetch(c.url, {
         mode: 'no-cors',
@@ -101,19 +122,40 @@ export async function probeInPage(urls, opts) {
         signal: ctrl ? ctrl.signal : undefined,
       }).then(
         (res) => {
-          // 立即中断，别真下视频
+          // 拿到响应头就中断，别真把视频拉下来
           try {
             if (ctrl) ctrl.abort();
           } catch {}
-          return done(true);
+          finish(true);
         },
-        (e) => done(false, String((e && e.message) || e))
+        (e) => finish(false, String((e && e.message) || e))
       );
     } catch (e) {
-      return Promise.resolve(done(false, String((e && e.message) || e)));
+      finish(false, String((e && e.message) || e));
+      return Promise.resolve();
     }
   };
 
-  const all = await Promise.all(list.map(one));
-  return all.sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms);
+  const all = Promise.all(list.map(one));
+  all.catch(() => {});
+
+  if (early) {
+    await Promise.race([all, early]);
+    if (earlyTimer) {
+      clearTimeout(earlyTimer);
+      earlyTimer = null;
+    }
+    for (let i = 0; i < list.length; i++) {
+      if (!results[i]) {
+        clearTimeout(timers[i]);
+        if (ctrls[i]) ctrls[i].abort();
+      }
+    }
+  } else {
+    await all;
+  }
+
+  return results
+    .filter(Boolean)
+    .sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms);
 }

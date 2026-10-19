@@ -24,6 +24,14 @@ export const NAME = 'bili-302';
 
 /** ASN 偏好记忆时长（秒） */
 export const ASN_TTL = 6 * 3600;
+/** 探测全失败时的负缓存时长（秒） */
+export const ASN_NEG_TTL = 900;
+/** 单个候选的探测预算上限（黑洞节点最坏拖到这个数） */
+export const PROBE_TIMEOUT_MS = 1500;
+/** 首选成功后多等一会，让同时到达的结果进排名；之后放弃慢节点 */
+export const PROBE_GRACE_MS = 150;
+
+const nowSec = () => Math.floor(Date.now() / 1000);
 
 const asnKeyOf = (asn) => (asn ? `cdn:asn:${String(asn).trim()}` : null);
 
@@ -49,8 +57,9 @@ const HELP = `${NAME} — bilibili 视频直链短地址
                                -> 手动选定并记到该访问者的 ASN（/cdn/<asn> 可查）
 
 不传 h/i 时，若部署端提供了访问者 ASN（Cloudflare Worker），会优先用
-该 ASN 记住的节点；没记过就从边缘探一次，把最快的那个记 6 小时。
-书签在浏览器里探活后会把最快的节点随 /push 上报（by=client，最准）。
+该 ASN 记住的节点；没记过就后台探一次（Worker 用 waitUntil，不阻塞本次 302），
+把最快的那个记 6 小时。书签在浏览器里探活后会把最快的节点随 /push 上报
+（by=client，最准）。
 
 说明：本服务只做「签名」，不中转视频流量，播放在你的播放器与 CDN 之间直连。
 链接有效期约 2 小时（bilibili 的 deadline）；过期请重新请求短链，不要转发 302 之后的直链。
@@ -105,6 +114,7 @@ function asset(body, type, cache = 'no-cache') {
  *   pushToken?: string,
  *   client?: {asn?: string|number, country?: string, colo?: string},
  *   learn?: boolean,
+ *   waitUntil?: (p: Promise<any>) => void,
  * }} [opts] basePath 用于「path 前缀」部署；pushToken 有值时 /push 需要 Bearer
  *           client.asn 有值时启用「按 ASN 记忆最佳 CDN 节点」（learn 控制是否自动探测）
  */
@@ -207,6 +217,7 @@ export async function handle(req, opts = {}) {
     asnKey,
     learn,
     client,
+    waitUntil: opts.waitUntil || null,
   };
 
   try {
@@ -276,7 +287,7 @@ async function safePut(cache, key, value, ttl) {
  * Worker 默认开启 2/3；Node 本地跑时没有 ASN，直接走 4。
  */
 async function pickCdn(urls, ctx) {
-  const { explicit, choice, asnKey, cache, learn, fetchImpl, remember } = ctx;
+  const { explicit, choice, asnKey, cache, learn, remember } = ctx;
 
   if (explicit) {
     const picked = selectCandidate(urls, choice);
@@ -284,7 +295,7 @@ async function pickCdn(urls, ctx) {
       await safePut(
         cache,
         asnKey,
-        { tag: picked.tag, host: picked.host, at: Math.floor(Date.now() / 1000), by: 'manual' },
+        { tag: picked.tag, host: picked.host, at: nowSec(), by: 'manual' },
         ASN_TTL
       );
     }
@@ -295,41 +306,54 @@ async function pickCdn(urls, ctx) {
     const known = await safeGet(cache, asnKey);
     const hit = known && known.tag ? urls.find((c) => c.tag === known.tag) : null;
     if (hit) return { picked: hit, source: 'asn' };
-    // 刚探过但全不可达：别每次都再探一遍（负缓存 15 分钟）
+    // 刚探过但全不可达：别每次都再探一遍（负缓存）
     if (known && known.by === 'probe-empty') return { picked: urls[0], source: 'default' };
 
     if (learn) {
-      try {
-        // 边缘节点跟访问者在同一片网络，探测结果比服务器出口更有参考价值
-        const probe = await probeCandidates(urls, fetchImpl, { timeoutMs: 1500 });
-        const best = probe.find((p) => p.ok);
-        const hit = best ? urls.find((c) => c.tag === best.tag) : null;
-        if (hit) {
-          await safePut(
-            cache,
-            asnKey,
-            {
-              tag: hit.tag,
-              host: hit.host,
-              ms: best.ms,
-              at: Math.floor(Date.now() / 1000),
-              by: 'probe',
-            },
-            ASN_TTL
-          );
-          return { picked: hit, source: 'probe' };
-        }
-        await safePut(
-          cache,
-          asnKey,
-          { tag: null, at: Math.floor(Date.now() / 1000), by: 'probe-empty' },
-          900
-        );
-      } catch {}
+      // 关键：Worker 有 waitUntil 时，探测放到响应之后跑。
+      // 这次请求立刻用默认节点 302，下次同 ASN 的请求就能命中记忆。
+      if (typeof ctx.waitUntil === 'function') {
+        ctx.waitUntil(learnAsn(urls, ctx));
+        return { picked: urls[0], source: 'default', learning: true };
+      }
+      // 本地/自建服务器没有 waitUntil，只能同步探（最坏 PROBE_TIMEOUT_MS）
+      const tag = await learnAsn(urls, ctx);
+      const learned = tag ? urls.find((c) => c.tag === tag) : null;
+      if (learned) return { picked: learned, source: 'probe' };
     }
   }
 
   return { picked: urls[0], source: 'default' };
+}
+
+/**
+ * 探一轮并把结果写进 ASN 记忆。返回选中的 tag（全失败返回 null）。
+ * 失败也不抛：调用方可能是 waitUntil 里的后台任务。
+ */
+async function learnAsn(urls, ctx) {
+  const { asnKey, cache, fetchImpl } = ctx;
+  if (!asnKey || !cache) return null;
+  try {
+    // 只要冠军：首个成功 + 150ms 收尾，黑洞节点不再拖满 1.5s
+    const probe = await probeCandidates(urls, fetchImpl, {
+      timeoutMs: PROBE_TIMEOUT_MS,
+      settle: 'first-ok',
+      graceMs: PROBE_GRACE_MS,
+    });
+    const best = probe.find((p) => p.ok);
+    const hit = best ? urls.find((c) => c.tag === best.tag) : null;
+    if (hit) {
+      await safePut(
+        cache,
+        asnKey,
+        { tag: hit.tag, host: hit.host, ms: best.ms, at: nowSec(), by: 'probe' },
+        ASN_TTL
+      );
+      return hit.tag;
+    }
+    await safePut(cache, asnKey, { tag: null, at: nowSec(), by: 'probe-empty' }, ASN_NEG_TTL);
+  } catch {}
+  return null;
 }
 
 /** 统一的响应：302 或 JSON */
@@ -337,7 +361,7 @@ async function respond(hit, ctx) {
   const { mode, base, bvid, page, qn, wantProbe, fetchImpl } = ctx;
   // 直链签名是「路径 + 参数」绑定的，换主机名不需要重新签名
   const urls = Array.isArray(hit.urls) && hit.urls.length ? hit.urls : cdnCandidates(hit.url);
-  const { picked, source } = await pickCdn(urls, ctx);
+  const { picked, source, learning } = await pickCdn(urls, ctx);
 
   if (mode === 'json') {
     const body = {
@@ -346,6 +370,7 @@ async function respond(hit, ctx) {
       urls,
       cdn: picked.tag,
       cdnSource: source,
+      ...(learning ? { cdnLearning: true } : {}),
       client: ctx.client || null,
       short: `${base}/p/${bvid}?p=${page}&qn=${qn}`,
       expiresInSeconds: hit.deadline ? hit.deadline - Math.floor(Date.now() / 1000) : null,
@@ -365,6 +390,7 @@ async function respond(hit, ctx) {
       'X-Bili-Page': String(page),
       'X-Bili-Cdn': picked.tag,
       'X-Bili-Cdn-Source': source,
+      ...(learning ? { 'X-Bili-Cdn-Learning': '1' } : {}),
       'X-Bili-Source': hit.fromPush ? 'push' : 'live',
       ...(hit.degraded ? { 'X-Bili-Degraded': '1' } : {}),
     }),

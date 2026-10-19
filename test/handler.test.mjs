@@ -470,3 +470,182 @@ test('probeInPage: 按可达 + 快慢排序（浏览器端探活）', async () =
   assert.equal(ranked[ranked.length - 1].ok, false);
   assert.equal(seen[0].mode, 'no-cors'); // CDN 没有 CORS 头也要能探
 });
+
+test('Worker 有 waitUntil 时：首次 302 不等待探测，学习在响应后后台完成', async () => {
+  const cache = memCache();
+  const base = fakeFetch();
+  let probes = 0;
+  const slow = async (url, init) => {
+    const u = new URL(url);
+    if (u.pathname.startsWith('/upgcxcode/')) {
+      probes++;
+      await new Promise((r) => setTimeout(r, 250)); // 模拟慢探测
+      return new Response('x', { status: u.host.includes('mirrorcos.') ? 206 : 403 });
+    }
+    return base(url, init);
+  };
+  const background = [];
+  const opts = {
+    cache,
+    fetchImpl: slow,
+    client: { asn: 45090 },
+    waitUntil: (p) => background.push(p),
+  };
+
+  const t0 = Date.now();
+  const r1 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  const elapsed = Date.now() - t0;
+
+  assert.equal(r1.status, 302);
+  assert.equal(r1.headers.get('x-bili-cdn-source'), 'default');
+  assert.equal(r1.headers.get('x-bili-cdn-learning'), '1');
+  assert.ok(elapsed < 150, `302 不该等探测，实际 ${elapsed}ms`);
+  assert.equal(cache.store.get('cdn:asn:45090'), undefined, '响应时记忆还没写好');
+  assert.equal(background.length, 1);
+
+  await Promise.all(background);
+  assert.equal(cache.store.get('cdn:asn:45090').tag, 'cos');
+
+  const r2 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  assert.equal(r2.headers.get('x-bili-cdn'), 'cos');
+  assert.equal(r2.headers.get('x-bili-cdn-source'), 'asn');
+  assert.equal(r2.headers.get('x-bili-cdn-learning'), null);
+});
+
+test('探测超时上限：卡死的节点不会把请求拖过 PROBE_TIMEOUT_MS', async () => {
+  const { probeCandidates } = await import('../src/bili.mjs');
+  const { cdnCandidates } = await import('../src/cdn.mjs');
+  const { PROBE_TIMEOUT_MS } = await import('../src/handler.mjs');
+  const urls = cdnCandidates(mediaUrl(16)).slice(0, 3);
+  const hang = (url, init) =>
+    new Promise((_, reject) => {
+      // 永不回应，只等 AbortSignal 超时；模拟黑洞节点
+      if (init && init.signal) init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+    });
+  const started = Date.now();
+  const ranked = await probeCandidates(urls, hang, { timeoutMs: 200 });
+  assert.ok(Date.now() - started < 1000);
+  assert.ok(ranked.every((r) => !r.ok));
+  assert.ok(PROBE_TIMEOUT_MS <= 2000);
+});
+
+// ── probe 的 first-ok 收尾策略（黑洞节点不再拖满超时）──────────
+
+const { probeInPage } = await import('../src/cdn.mjs');
+
+const okAfter = (ms, status = 206) => () =>
+  new Promise((resolve) => setTimeout(() => resolve(new Response('', { status })), ms));
+const hangUntilAbort = (url, init) =>
+  new Promise((_, reject) => {
+    if (init && init.signal) {
+      if (init.signal.aborted) return reject(new Error('aborted'));
+      init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+    }
+  });
+
+test('probeCandidates first-ok + grace：30ms 成功后 ~180ms 收工', async () => {
+  const { probeCandidates } = await import('../src/bili.mjs');
+  const { cdnCandidates } = await import('../src/cdn.mjs');
+  const urls = cdnCandidates(mediaUrl(16));
+
+  const fake = (url, init) => {
+    const host = new URL(url).host;
+    if (host === 'upos-sz-mirrorali.bilivideo.com') return okAfter(20)(); // 冠军
+    if (host === 'upos-sz-mirrorcos.bilivideo.com') return okAfter(60)(); // 落在 grace 窗口内
+    return hangUntilAbort(url, init); // 黑洞
+  };
+
+  const t0 = Date.now();
+  const ranked = await probeCandidates(urls, fake, {
+    timeoutMs: 1500,
+    settle: 'first-ok',
+    graceMs: 150,
+  });
+  const elapsed = Date.now() - t0;
+
+  assert.ok(elapsed < 700, `不该等黑洞，实际 ${elapsed}ms`);
+  assert.deepEqual(ranked.map((r) => r.tag).sort(), ['ali', 'cos']); // grace 窗口内的也在
+  assert.ok(ranked.every((r) => r.ok));
+  assert.equal(ranked[0].tag, 'ali'); // 快的在前
+});
+
+test('probeCandidates first-ok + grace=0：只拿冠军，立刻返回', async () => {
+  const { probeCandidates } = await import('../src/bili.mjs');
+  const { cdnCandidates } = await import('../src/cdn.mjs');
+  const urls = cdnCandidates(mediaUrl(16));
+  const fake = (url, init) => {
+    const host = new URL(url).host;
+    if (host === 'upos-sz-mirrorhw.bilivideo.com') return okAfter(10)();
+    return hangUntilAbort(url, init);
+  };
+  const t0 = Date.now();
+  const ranked = await probeCandidates(urls, fake, { timeoutMs: 1500, settle: 'first-ok' });
+  assert.equal(ranked.length, 1);
+  assert.equal(ranked[0].tag, 'hw');
+  assert.ok(Date.now() - t0 < 400);
+});
+
+test('默认 settle=all 保持原样：完整排名，含失败的', async () => {
+  const { probeCandidates } = await import('../src/bili.mjs');
+  const { cdnCandidates } = await import('../src/cdn.mjs');
+  const urls = cdnCandidates(mediaUrl(16));
+  const fake = (url, init) =>
+    new URL(url).host === 'upos-sz-mirrorcos.bilivideo.com'
+      ? okAfter(10)()
+      : Promise.resolve(new Response('', { status: 403 }));
+  const ranked = await probeCandidates(urls, fake, { timeoutMs: 500 });
+  assert.equal(ranked.length, urls.length);
+  assert.equal(ranked[0].tag, 'cos');
+  assert.ok(ranked.slice(1).every((r) => !r.ok));
+});
+
+test('learnAsn 用 first-ok：后台学习不被黑洞节点拖慢', async () => {
+  const cache = memCache();
+  const base = fakeFetch();
+  const impl = (url, init) => {
+    const u = new URL(url);
+    if (u.pathname.startsWith('/upgcxcode/')) {
+      if (u.host === 'upos-sz-mirrorcos.bilivideo.com') return okAfter(10)();
+      return hangUntilAbort(url, init);
+    }
+    return base(url, init);
+  };
+  const background = [];
+  const t0 = Date.now();
+  const r1 = await handle(req('/p/BV1GJ411x7h7?qn=16'), {
+    cache,
+    fetchImpl: impl,
+    client: { asn: 4808 },
+    waitUntil: (p) => background.push(p),
+  });
+  assert.equal(r1.status, 302);
+
+  await Promise.all(background);
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 900, `后台学习被拖慢了：${elapsed}ms`);
+  assert.equal(cache.store.get('cdn:asn:4808').tag, 'cos');
+});
+
+test('probeInPage first-ok：书签端也不等黑洞节点', async () => {
+  const { probeInPage, cdnCandidates } = await import('../src/cdn.mjs');
+  const urls = cdnCandidates(mediaUrl(16));
+  const fake = (url, init) => {
+    const host = new URL(url).host;
+    if (host === 'upos-sz-mirrorhw.bilivideo.com') {
+      return new Promise((r) => setTimeout(() => r(new Response('')), 10));
+    }
+    return new Promise((_, rej) => {
+      if (init.signal) init.signal.addEventListener('abort', () => rej(new Error('aborted')));
+    });
+  };
+  const t0 = Date.now();
+  const ranked = await probeInPage(urls, {
+    settle: 'first-ok',
+    graceMs: 100,
+    timeoutMs: 2000,
+    fetchImpl: fake,
+  });
+  assert.equal(ranked.length, 1);
+  assert.equal(ranked[0].tag, 'hw');
+  assert.ok(Date.now() - t0 < 500, `实际 ${Date.now() - t0}ms`);
+});

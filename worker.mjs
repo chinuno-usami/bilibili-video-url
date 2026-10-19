@@ -65,6 +65,8 @@ export default {
       client: { asn: cf.asn, country: cf.country, colo: cf.colo },
       // CDN_LEARN=0 可关掉自动探测（只用手动 remember 下来的）
       learn: !(env && env.CDN_LEARN === '0'),
+      // 探测放到响应之后（Learners 用 waitUntil），别拖慢首次 302
+      waitUntil: ctx && typeof ctx.waitUntil === 'function' ? (p) => ctx.waitUntil(p) : null,
     });
   },
 };
