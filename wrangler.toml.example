@@ -1,0 +1,33 @@
+# 复制成 wrangler.toml 再填自己的值。
+# wrangler.toml 已加入 .gitignore，避免把 KV id / 域名提交到公开仓库。
+
+name = "bili-302"
+main = "worker.mjs"
+compatibility_date = "2024-11-01"
+
+# ── 绑定自己的域名（二选一，同时写会冲突）──
+
+# A) 整域名（DNS 在同一个 Cloudflare 账号下，推荐）
+# [[routes]]
+# pattern = "bili.example.com"
+# custom_domain = true
+
+# B) 挂在某个域名的子路径下
+# [[routes]]
+# pattern = "example.com/bili/*"
+# zone_name = "example.com"
+
+[vars]
+# 仅 B 方案需要
+# BASE_PATH = "/bili"
+
+# ── 推送缓存用的 KV ──
+#   npx wrangler kv namespace create PUSH
+# 把输出的 id 填进来
+# [[kv_namespaces]]
+# binding = "PUSH"
+# id = "<your-kv-namespace-id>"
+
+# ── /push 保护（推荐）──
+# 用 secret 而不是写在这里：
+#   npx wrangler secret put PUSH_TOKEN

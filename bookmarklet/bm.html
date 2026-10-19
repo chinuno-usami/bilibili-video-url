@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>bili-302 · 书签小工具</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{margin:0;padding:40px 20px;font:15px/1.7 -apple-system,"PingFang SC",system-ui,sans-serif;background:#0f1115;color:#e8eaed}
+  .w{max-width:720px;margin:0 auto}
+  h1{font-size:22px;margin:0 0 6px}
+  .sub{color:#8b93a1;margin-bottom:26px}
+  h2{font-size:15px;margin:26px 0 8px;color:#c9d1d9}
+  ol,ul{padding-left:22px;margin:8px 0}
+  li{margin:5px 0}
+  code{background:#1a1d23;border:1px solid #2b2f38;border-radius:5px;padding:1px 5px;font:12.5px ui-monospace,Menlo,monospace;color:#7ee787}
+  pre{background:#14171c;border:1px solid #23272f;border-radius:8px;padding:12px;overflow:auto;font:12.5px/1.6 ui-monospace,Menlo,monospace;color:#9fb3c8}
+  .bm{display:inline-block;margin:10px 0;padding:9px 18px;background:#1d3a5c;border:1px solid #2c5c92;border-radius:8px;color:#cfe4ff;text-decoration:none;font-weight:600}
+  .bm:hover{background:#224570}
+  .note{border-left:3px solid #2c5c92;padding:2px 0 2px 14px;color:#9aa4b2;margin:16px 0}
+  table{border-collapse:collapse;margin:10px 0;font-size:13.5px}
+  td,th{border:1px solid #23272f;padding:5px 10px;text-align:left}
+  th{background:#171b21;color:#c9d1d9}
+</style>
+</head>
+<body>
+<div class="w">
+  <h1>bili-302 · 书签小工具</h1>
+  <div class="sub">在 B 站任意视频页点一下，拿到可贴进 VRChat 的短地址。</div>
+
+  <p>把下面这个按钮<strong>拖到书签栏</strong>（不要点击，是拖动）：</p>
+  <p><a class="bm" id="bm" href="#" draggable="true">解析 B 站 → 短链</a></p>
+
+  <h2>或者手动添加</h2>
+  <ol>
+    <li>Chrome / Edge：<code>⌘D</code> 收藏当前页 → 编辑 → 名称填「解析 B 站」</li>
+    <li>URL 一栏清空，粘贴下面这段：</li>
+  </ol>
+  <pre id="code"></pre>
+  <div class="note">这段代码只是注入一个 <code>&lt;script&gt;</code>，真正的逻辑在 <code id="jsurl"></code>。所以 BASE 变了只需重新打开本页拖一次。</div>
+
+  <h2>用法</h2>
+  <ol>
+    <li>打开任意 B 站视频页（<code>bilibili.com/video/BV...</code>）</li>
+    <li>点书签 → 弹窗显示标题、清晰度、短链、直链</li>
+    <li>点「复制短链」，贴进 VRChat 播放器</li>
+    <li>分 P 会自动从当前 URL 的 <code>?p=</code> 读取；点 720P / 360P 可切换重新解析</li>
+  </ol>
+
+  <h2>两种地址的区别</h2>
+  <table>
+    <tr><th>地址</th><th>有效期</th><th>用途</th></tr>
+    <tr><td><code>/p/BV1...?qn=64</code></td><td>长期（每次请求实时签名）</td><td>贴进 VRChat / 播放器</td></tr>
+    <tr><td>CDN 直链（500+ 字符）</td><td>2 小时</td><td>临时下载、调试</td></tr>
+  </table>
+
+  <h2>排错</h2>
+  <ul>
+    <li><strong>点了没反应</strong>：B 站页面偶尔会重写 <code>document</code>，再点一次；或刷新页面后点。</li>
+    <li><strong>提示混合内容</strong>：当前页面是 https，而服务是 http。改用 <code>http://127.0.0.1:8787</code> 或把服务部署到 https。</li>
+    <li><strong>解析失败</strong>：先直接访问 <code id="health"></code> 看服务是否存活。</li>
+  </ul>
+</div>
+<script>
+  (function () {
+    var base = location.origin;
+    var loader =
+      'javascript:(function(){var s=document.createElement("script");s.src=' +
+      JSON.stringify(base + '/bookmarklet.js') +
+      ';s.onerror=function(){alert("加载书签脚本失败：' + base + '/bookmarklet.js")};' +
+      '(document.body||document.documentElement).appendChild(s);})()';
+    document.getElementById('bm').setAttribute('href', loader);
+    document.getElementById('code').textContent = loader;
+    document.getElementById('jsurl').textContent = base + '/bookmarklet.js';
+    document.getElementById('health').textContent = base + '/healthz';
+  })();
+</script>
+</body>
+</html>

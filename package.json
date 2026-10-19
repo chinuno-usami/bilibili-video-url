@@ -1,0 +1,22 @@
+{
+  "name": "bili-302",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "把 B 站 BV 号变成可直接播放的 CDN 直链短地址（只签名，不中转流量）",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs 8787",
+    "test": "node --test test/*.test.mjs",
+    "deploy": "wrangler deploy",
+    "bm": "node bookmarklet/build.mjs",
+    "deploy:dry": "wrangler deploy --dry-run --outdir=.dryrun"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "wrangler": "^4.151.1"
+  }
+}

@@ -1,0 +1,18 @@
+node_modules/
+.wrangler/
+wrangler.toml
+.dryrun/
+
+# 生成物：由 bookmarklet/build.mjs 产出，不入库
+public/
+browser-bm*.txt
+
+# 本地密钥 / 部署变量
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+
+# 系统垃圾
+.DS_Store
+*.log
