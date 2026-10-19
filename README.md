@@ -168,7 +168,7 @@ node bookmarklet/build.mjs https://your.host     # 生成书签代码
 ### 测试
 
 ```bash
-npm test     # 44 个用例，全部用假 fetch，不联网
+npm test     # 56 个用例，全部用假 fetch，不联网
 ```
 
 ## 「别人连不上」怎么办
@@ -303,6 +303,61 @@ curl -s -o /dev/null -w '%{http_code}\n' -r 0-1023 -A 'Mozilla/5.0' "<直链>"  
 - 单文件 mp4 是 h264+aac，`moov` 在文件头（faststart），支持边下边播和 seek：中段 `Range: bytes=20000000-` → 206。
 - 不支持：番剧（`ep`）、付费课程、需要登录/大会员的视频、`bangumi` 类型。这些会返回 403 并说明原因。
 - 请只用于个人观看，不要公开部署成面向大量用户的服务——那会把你的服务器暴露在别人的滥用之下。
+
+## 首次请求很慢 / 超时，第二次才正常
+
+典型症状：mpv / VRChat 第一次打开短链，TLS 连接超时（20s），再试一次秒开。
+
+原因不是 CDN，而是**冷启动要现场打 bilibili API**：
+
+```
+旧：spi ──▶ nav ──▶ view ──▶ playurl    4 个串行 RTT，机房/海外出口单次可能 5-10s
+                                   └─ 若遇 412 还要 ×3 次重试 + 退避
+```
+
+Worker 最终跑完了、把直链写进 KV，但播放器早就超时放弃 → 于是「第一次失败、第二次成功」。
+第二次命中 KV，不碰上游，所以快。
+
+现在做了四件事：
+
+| 改动 | 效果 |
+|---|---|
+| `spi` / `nav` 并行，且**第 0 次请求不等 session**（无 Cookie 先打 view，失败再补） | 冷路径 4 RTT → 2 RTT |
+| 单次上游请求上限 `UPSTREAM_TIMEOUT_MS = 3000` | 不再有一个请求挂 10s |
+| 冷路径总预算 `COLD_BUDGET_MS = 9000` | 最坏 9s 内一定给答复，不会拖到播放器超时 |
+| 超时后**后台补签**（`waitUntil`，预算 20s，同一键 2 分钟一次） | 这次 504，重试就命中缓存，不会永远冷 |
+
+排查用 `X-Bili-Upstream-Ms`（只在现场解析时出现）：
+
+```bash
+curl -so /dev/null -D- -w 'total=%{time_total}s\n' \
+  'https://your.host/p/BV1yDn368En2?qn=16' | grep -i 'x-bili\|total='
+```
+
+- `X-Bili-Upstream-Ms: 812` → 上游 0.8s，正常
+- `X-Bili-Upstream-Ms: 8900` 且 `total≈9s` → 你这条链路对 bilibili 就是慢，调大预算：
+  ```toml
+  [vars]
+  COLD_BUDGET_MS = "15000"   # 播放器超时之前给上游更多时间
+  ```
+- 直接 504 → 上游不可达/超时，看响应正文里的上游原文
+
+如果上游**长期**不可用（持续 504 或 -412），冷路径永远不行，只能预热：
+
+```bash
+# 在浏览器里点书签（会自动 POST /push），或手动：
+curl -X POST https://your.host/push -H 'Content-Type: application/json' \
+  -d '{"bvid":"BV1yDn368En2","p":1,"qn":64,"url":"<浏览器解析出的直链>"}'
+```
+
+也可以试 Cloudflare 的 Smart Placement（让 Worker 靠近 bilibili 而不是靠近用户）：
+
+```toml
+[placement]
+mode = "smart"
+```
+
+它只优化「回源」，用户侧那 302 依然走边缘，值得一试。
 
 ## 遇到 412 / 风控怎么办
 

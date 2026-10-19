@@ -649,3 +649,128 @@ test('probeInPage first-ok：书签端也不等黑洞节点', async () => {
   assert.equal(ranked[0].tag, 'hw');
   assert.ok(Date.now() - t0 < 500, `实际 ${Date.now() - t0}ms`);
 });
+
+// ── 冷启动预算：首次请求不许把播放器拖到超时 ──────────────────
+
+test('冷启动不等 session：指纹/WBI 慢也不影响首包', async () => {
+  const calls = [];
+  const slowSession = (url) => {
+    const u = new URL(url);
+    calls.push({ path: u.pathname, headers: {} });
+    // spi / nav 慢 150ms
+    if (u.pathname.includes('/finger/spi') || u.pathname.includes('/web-interface/nav')) {
+      return new Promise((r) => setTimeout(() => r(new Response('{}')), 150));
+    }
+    return Promise.resolve(new Response(JSON.stringify(PLAY(137649199, 64))));
+  };
+  const view = async (url, init) => {
+    const u = new URL(url);
+    calls.push({ path: u.pathname, headers: (init && init.headers) || {} });
+    if (u.pathname === '/x/web-interface/view') {
+      return new Response(JSON.stringify(VIEW));
+    }
+    return new Response(JSON.stringify(PLAY(u.searchParams.get('qn') ? 64 : 64)));
+  };
+
+  const { resolveDirectUrl } = await import('../src/bili.mjs');
+  const t0 = Date.now();
+  const r = await resolveDirectUrl({ bvid: 'BV1GJ411x7h7', qn: 64 }, view);
+  const elapsed = Date.now() - t0;
+
+  assert.ok(elapsed < 120, `不该等 session，实际 ${elapsed}ms`);
+  assert.match(r.url, /bilivideo\.com/);
+  const first = calls.find((c) => c.path === '/x/web-interface/view');
+  assert.equal(first.headers.Cookie, undefined, '第 0 次不带 Cookie，抢 RTT');
+  assert.ok(r.timings && typeof r.timings.totalMs === 'number');
+});
+
+test('上游黑洞：预算内快速 504，不再重试到天荒地老', async () => {
+  const { resolveDirectUrl } = await import('../src/bili.mjs');
+  const hang = (url, init) =>
+    new Promise((_, reject) => {
+      if (init && init.signal) {
+        if (init.signal.aborted) return reject(new Error('TimeoutError'));
+        init.signal.addEventListener('abort', () => {
+          const e = new Error('The operation was aborted due to timeout');
+          e.name = 'TimeoutError';
+          reject(e);
+        });
+      }
+    });
+  const t0 = Date.now();
+  await assert.rejects(
+    () => resolveDirectUrl({ bvid: 'BV1GJ411x7h7' }, hang, { budgetMs: 900 }),
+    (e) => e.status === 504 && /超时/.test(e.message)
+  );
+  const elapsed = Date.now() - t0;
+  assert.ok(elapsed < 1600, `应在预算附近失败，实际 ${elapsed}ms`);
+});
+
+test('上游慢但成功：耗时可观测，且不超预算', async () => {
+  const { resolveDirectUrl } = await import('../src/bili.mjs');
+  const slow = (url) => {
+    const u = new URL(url);
+    const delay = u.pathname === '/x/web-interface/view' ? 300 : 300;
+    const body =
+      u.pathname === '/x/web-interface/view'
+        ? VIEW
+        : PLAY(Number(u.searchParams.get('cid')), Number(u.searchParams.get('qn')));
+    return new Promise((r) =>
+      setTimeout(() => r(new Response(JSON.stringify(body))), delay)
+    );
+  };
+  const r = await resolveDirectUrl({ bvid: 'BV1GJ411x7h7' }, slow, { budgetMs: 3000 });
+  assert.ok(r.timings.totalMs >= 550, JSON.stringify(r.timings));
+  assert.ok(r.timings.viewMs >= 280 && r.timings.playMs >= 280);
+});
+
+test('X-Bili-Upstream-Ms：现场解析有，缓存命中没有', async () => {
+  const cache = memCache();
+  const first = await handle(req('/p/BV1GJ411x7h7?qn=16'), { fetchImpl: fakeFetch(), cache });
+  assert.equal(first.status, 302);
+  assert.ok(Number(first.headers.get('x-bili-upstream-ms')) >= 0);
+
+  const second = await handle(req('/p/BV1GJ411x7h7?qn=16'), { fetchImpl: fakeFetch(), cache });
+  assert.equal(second.headers.get('x-bili-upstream-ms'), null);
+});
+
+test('冷启动超时：本次快速 504，后台补签写 KV，第二次直接命中', async () => {
+  const cache = memCache();
+  const slowUpstream = (url) => {
+    const u = new URL(url);
+    if (u.pathname.includes('/finger/spi') || u.pathname.includes('/web-interface/nav')) {
+      return Promise.resolve(new Response('{}'));
+    }
+    const body =
+      u.pathname === '/x/web-interface/view'
+        ? VIEW
+        : PLAY(Number(u.searchParams.get('cid')), Number(u.searchParams.get('qn')));
+    return new Promise((r) => setTimeout(() => r(new Response(JSON.stringify(body))), 700));
+  };
+  const background = [];
+  const opts = {
+    cache,
+    fetchImpl: slowUpstream,
+    coldBudgetMs: 300,
+    waitUntil: (p) => background.push(p),
+  };
+
+  const t0 = Date.now();
+  const r1 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  const elapsed = Date.now() - t0;
+  assert.equal(r1.status, 504);
+  assert.match(await r1.text(), /超时/);
+  assert.ok(elapsed < 600, `应快速失败，实际 ${elapsed}ms`);
+  assert.equal(background.length, 1);
+  assert.ok(cache.store.get('warm:BV1GJ411x7h7:1:16'), '应加补签锁，避免并发风暴');
+
+  await Promise.all(background);
+  assert.ok(cache.store.get('u:BV1GJ411x7h7:1:16'), '后台应把结果写进缓存');
+
+  const noUpstream = async () => {
+    throw new Error('不该再打上游');
+  };
+  const r2 = await handle(req('/p/BV1GJ411x7h7?qn=16'), { cache, fetchImpl: noUpstream });
+  assert.equal(r2.status, 302);
+  assert.match(r2.headers.get('location'), /bilivideo\.com/);
+});

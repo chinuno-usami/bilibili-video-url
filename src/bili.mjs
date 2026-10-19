@@ -20,6 +20,25 @@ const BROWSER_HEADERS = {
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 };
 
+// ── 上游超时预算 ───────────────────────────────────────────────
+// 冷启动（KV 未命中）时要现场打 bilibili：view -> playurl。
+// 从海外/机房访问 api.bilibili.com 偶尔单次就 5-10s，没有上限的话
+// 「首次请求」会拖到播放器超时（mpv/ffmpeg、yt-dlp 默认 20s），
+// 而 Worker 其实还在跑，等它跑完把结果写进 KV —— 于是第二次请求秒开。
+// 所以：单次请求有上限，整条冷路径有总预算，超了就快速失败让客户端重试。
+export const UPSTREAM_TIMEOUT_MS = 3000;
+export const COLD_BUDGET_MS = 9000;
+const MIN_ATTEMPT_MS = 500;
+
+const timeoutSignal = (ms) =>
+  typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined;
+
+const isTimeout = (err) => {
+  const name = String((err && err.name) || '');
+  return name === 'TimeoutError' || name === 'AbortError' || /time[ds]?\s*out|timed out/i.test(String((err && err.message) || ''));
+};
+const msLeft = (deadline) => Math.max(0, deadline - Date.now());
+
 // CDN 候选表与选择逻辑在 cdn.mjs（书签脚本也要用同一份），这里只保留
 // 「服务端探活」——它会带浏览器 UA，因为 CDN 对 UA 有白名单。
 export { CDN_MIRRORS, cdnCandidates, cdnTagOf, selectCandidate } from './cdn.mjs';
@@ -142,12 +161,14 @@ export class HttpError extends Error {
 // buvid 是 bilibili 的设备指纹 cookie，不带它匿名请求更容易被判爬虫。
 // WBI 密钥每天轮换，所以带 TTL 缓存。
 
-let session = null; // { buvid3, buvid4, mixin, fetchedAt }
+let session = null; // { buvid3, buvid4, mixin, expiresAt }
 const SESSION_TTL = 30 * 60 * 1000;
+const SESSION_FAIL_TTL = 60 * 1000; // 拿不到指纹时只记 1 分钟，别把空会话缓存半小时
 
-async function rawJson(url, fetchImpl, extraHeaders) {
+async function rawJson(url, fetchImpl, extraHeaders, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const res = await fetchImpl(url, {
     headers: { ...BROWSER_HEADERS, ...extraHeaders },
+    signal: timeoutSignal(timeoutMs),
   });
   const text = await res.text();
   let body = null;
@@ -157,27 +178,44 @@ async function rawJson(url, fetchImpl, extraHeaders) {
   return { res, text, body };
 }
 
-async function getSession(fetchImpl) {
-  if (session && Date.now() - session.fetchedAt < SESSION_TTL) return session;
+let sessionInflight = null; // 并发去重：预热和重试共用同一趟请求
 
-  const next = { buvid3: null, buvid4: null, mixin: null, fetchedAt: Date.now() };
+/** 指纹 + WBI 密钥：两个请求并行，少一个 RTT */
+async function getSession(fetchImpl, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  if (session && session.expiresAt > Date.now()) return session;
+  if (sessionInflight) return sessionInflight;
+
+  sessionInflight = buildSession(fetchImpl, timeoutMs).finally(() => {
+    sessionInflight = null;
+  });
+  return sessionInflight;
+}
+
+async function buildSession(fetchImpl, timeoutMs) {
+  const next = { buvid3: null, buvid4: null, mixin: null, expiresAt: 0 };
 
   // 设备指纹（不需要登录）
-  try {
-    const { body } = await rawJson(`${BILI}/x/frontend/finger/spi`, fetchImpl);
-    if (body && body.code === 0 && body.data) {
-      next.buvid3 = body.data.b_3 || null;
-      next.buvid4 = body.data.b_4 || null;
-    }
-  } catch {}
+  const spi = rawJson(`${BILI}/x/frontend/finger/spi`, fetchImpl, undefined, timeoutMs)
+    .then(({ body }) => {
+      if (body && body.code === 0 && body.data) {
+        next.buvid3 = body.data.b_3 || null;
+        next.buvid4 = body.data.b_4 || null;
+      }
+    })
+    .catch(() => {});
 
   // WBI 密钥（nav 未登录返回 code -101，但 wbi_img 照样有）
-  try {
-    const { body } = await rawJson(`${BILI}/x/web-interface/nav`, fetchImpl);
-    const w = body && body.data && body.data.wbi_img;
-    if (w) next.mixin = mixinKey(w.img_url, w.sub_url);
-  } catch {}
+  const wbi = rawJson(`${BILI}/x/web-interface/nav`, fetchImpl, undefined, timeoutMs)
+    .then(({ body }) => {
+      const w = body && body.data && body.data.wbi_img;
+      if (w) next.mixin = mixinKey(w.img_url, w.sub_url);
+    })
+    .catch(() => {});
 
+  await Promise.all([spi, wbi]);
+
+  const empty = !next.buvid3 && !next.mixin;
+  next.expiresAt = Date.now() + (empty ? SESSION_FAIL_TTL : SESSION_TTL);
   session = next;
   return session;
 }
@@ -198,42 +236,81 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * 带重试与多端点回退的 GET。
- * bilibili 的 412 有两种：UA 黑名单（HTML）与风控 ban（JSON code -412）。
- * 两者的共同解法是「换一套指纹 + 换一条路径」再试。
+ * 冷启动第 0 次故意**不等** session（无机密 Cookie、走普通端点），和指纹预热并行，
+ * 省掉一个 RTT；失败再等 session，用 WBI + Cookie 重试。
  */
-async function apiGet(pathBase, params, fetchImpl, { attempts = 3 } = {}) {
+async function apiGet(pathBase, params, fetchImpl, opts = {}) {
+  const attempts = opts.attempts || 3;
+  const deadline = Date.now() + (opts.budgetMs || COLD_BUDGET_MS);
   let last = null;
 
   for (let i = 0; i < attempts; i++) {
-    const s = await getSession(fetchImpl);
+    const left = msLeft(deadline);
+    if (left < MIN_ATTEMPT_MS) break;
+    const perCall = Math.min(UPSTREAM_TIMEOUT_MS, left);
+
+    let s = null;
+    if (i === 0 && !session) {
+      // 后台预热，不阻塞本次请求（失败也无所谓，重试时会再等它）
+      getSession(fetchImpl, perCall).catch(() => null);
+    } else {
+      s = await getSession(fetchImpl, perCall).catch(() => null);
+    }
     const cookie = cookieOf(s);
 
-    // 第 3 次起换回不带 WBI 的端点（签名反而可能因 wts 触发校验）
-    const useWbi = i < 2 && s.mixin;
+    // 0/2 次用普通端点，1 次用 WBI 签名；签名反而可能因 wts 触发校验，所以留了回退
+    const useWbi = i === 1 && s && s.mixin;
     const url = useWbi
       ? `${BILI}${pathBase.replace('/x/player/playurl', '/x/player/wbi/playurl')}?${signQuery(params, s.mixin)}`
       : `${BILI}${pathBase}?${new URLSearchParams(params).toString()}`;
 
-    const { res, text, body } = await rawJson(
-      url,
-      fetchImpl,
-      cookie ? { Cookie: cookie } : undefined
-    );
-    last = { status: res.status, text, body };
+    try {
+      const { res, text, body } = await rawJson(
+        url,
+        fetchImpl,
+        cookie ? { Cookie: cookie } : undefined,
+        perCall
+      );
+      last = { status: res.status, text, body };
 
-    if (res.ok && body && body.code === 0) return body;
+      if (res.ok && body && body.code === 0) return body;
 
-    // 视频本身的问题（不存在 / 无权限）不必重试
-    if (body && body.code !== 0 && body.code !== -412 && body.code !== -352) {
-      return body;
+      // 视频本身的问题（不存在 / 无权限）不必重试
+      if (body && body.code !== 0 && body.code !== -412 && body.code !== -352) {
+        return body;
+      }
+    } catch (err) {
+      last = { status: 0, text: String((err && err.message) || err), body: null };
+      if (!isTimeout(err)) {
+        // 其它网络错误（DNS/TLS）：给一次机会就够了
+        if (i >= 1) break;
+      }
+      if (Date.now() + MIN_ATTEMPT_MS >= deadline) break;
+      await sleep(120 * (i + 1));
+      continue;
     }
 
     // 指纹或密钥可能过期，下一次循环重取
     resetSession();
-    if (i < attempts - 1) await sleep(300 * (i + 1));
+    if (i < attempts - 1) {
+      const wait = Math.min(300 * (i + 1), Math.max(0, msLeft(deadline) - MIN_ATTEMPT_MS));
+      if (wait > 0) await sleep(wait);
+    }
   }
 
   const body = last && last.body;
+  if (last && last.status === 0) {
+    throw new HttpError(
+      504,
+      'bilibili 上游超时',
+      [
+        `单次上限 ${UPSTREAM_TIMEOUT_MS}ms，总预算 ${(opts.budgetMs || COLD_BUDGET_MS)}ms。`,
+        '冷启动（KV 没命中）要现场签名，机房/海外出口有时很慢。',
+        '直接重试通常就好（第一次可能已经把结果写进缓存）；VRChat 建议用书签预热。',
+        `上游原文：${(last.text || '').replace(/\s+/g, ' ').slice(0, 160)}`,
+      ].join('\n')
+    );
+  }
   if (last && last.status === 412) {
     const banned = body && body.code === -412;
     throw new HttpError(
@@ -250,7 +327,11 @@ async function apiGet(pathBase, params, fetchImpl, { attempts = 3 } = {}) {
       ].join('\n')
     );
   }
-  throw new HttpError(502, `上游返回异常（HTTP ${last ? last.status : '?'}）`, (last && last.text || '').slice(0, 200));
+  throw new HttpError(
+    502,
+    `上游返回异常（HTTP ${last ? last.status : '?'}）`,
+    (last && last.text || '').slice(0, 200)
+  );
 }
 
 /** 从各种输入里抠出 bvid / aid 和分P */
@@ -279,6 +360,7 @@ export async function expandShortLink(input, fetchImpl) {
       method: 'GET',
       redirect: 'follow',
       headers: BROWSER_HEADERS,
+      signal: timeoutSignal(UPSTREAM_TIMEOUT_MS),
     });
     return r.url || s;
   } catch {
@@ -290,15 +372,34 @@ export async function expandShortLink(input, fetchImpl) {
  * 核心：BV/av + 分P + 清晰度 -> 签名直链
  * @returns {{url:string, quality:number, acceptQuality:number[], title:string, bvid:string, cid:number, p:number, deadline:number|null}}
  */
-export async function resolveDirectUrl({ bvid, aid, p = 1, qn = 64 }, fetchImpl = fetch) {
+export async function resolveDirectUrl({ bvid, aid, p = 1, qn = 64 }, fetchImpl = fetch, opts = {}) {
   const q = QN_RE.test(String(qn)) ? Number(qn) : 64;
+  const started = Date.now();
+  const budgetDeadline = started + (opts.budgetMs || COLD_BUDGET_MS);
+  const budget = () => {
+    const left = msLeft(budgetDeadline);
+    if (left < MIN_ATTEMPT_MS) {
+      throw new HttpError(
+        504,
+        'bilibili 上游超时',
+        [
+          `冷启动总预算 ${opts.budgetMs || COLD_BUDGET_MS}ms 已用完（已花 ${Date.now() - started}ms）。`,
+          '直接重试通常就好；VRChat 建议先用书签 `/push` 预热。',
+        ].join('\n')
+      );
+    }
+    return left;
+  };
 
   // 1) 取 cid（分P 必须靠 pages[p-1].cid，playurl 不认 p 参数）
+  const viewStart = Date.now();
   const view = await apiGet(
     '/x/web-interface/view',
     bvid ? { bvid } : { aid: String(aid) },
-    fetchImpl
+    fetchImpl,
+    { budgetMs: budget() }
   );
+  const viewMs = Date.now() - viewStart;
   if (!view.data) {
     throw new HttpError(404, `取视频信息失败 (code=${view.code})`, view.message);
   }
@@ -311,6 +412,7 @@ export async function resolveDirectUrl({ bvid, aid, p = 1, qn = 64 }, fetchImpl 
   }
 
   // 2) 取播放地址：platform=html5 才会返回单文件 mp4 的 durl
+  const playStart = Date.now();
   const play = await apiGet(
     '/x/player/playurl',
     {
@@ -320,8 +422,10 @@ export async function resolveDirectUrl({ bvid, aid, p = 1, qn = 64 }, fetchImpl 
       platform: 'html5',
       high_quality: '1',
     },
-    fetchImpl
+    fetchImpl,
+    { budgetMs: budget() }
   );
+  const playMs = Date.now() - playStart;
 
   if (!play.data) {
     throw new HttpError(404, `取播放地址失败 (code=${play.code})`, play.message);
@@ -354,5 +458,7 @@ export async function resolveDirectUrl({ bvid, aid, p = 1, qn = 64 }, fetchImpl 
     cid: page.cid,
     p: Number(p),
     deadline,
+    // 冷路径耗时，用于排查「首次请求很慢」；缓存命中时没有这个字段
+    timings: { totalMs: Date.now() - started, viewMs, playMs },
   };
 }

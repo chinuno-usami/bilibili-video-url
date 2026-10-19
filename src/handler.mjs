@@ -1,6 +1,7 @@
 // 路由 + 响应。Web 标准 Request/Response，Worker 和 Node 都能跑。
 
 import {
+  COLD_BUDGET_MS as UPSTREAM_COLD_BUDGET_MS,
   HttpError,
   cdnCandidates,
   expandShortLink,
@@ -30,6 +31,10 @@ export const ASN_NEG_TTL = 900;
 export const PROBE_TIMEOUT_MS = 1500;
 /** 首选成功后多等一会，让同时到达的结果进排名；之后放弃慢节点 */
 export const PROBE_GRACE_MS = 150;
+/** 冷启动回给客户端的总预算（可用 COLD_BUDGET_MS 覆盖） */
+export const COLD_BUDGET_MS = UPSTREAM_COLD_BUDGET_MS;
+/** 冷启动超时后，后台补签的预算（客户端已经不等了，可以放宽） */
+export const WARM_BUDGET_MS = 20000;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -60,6 +65,9 @@ const HELP = `${NAME} — bilibili 视频直链短地址
 该 ASN 记住的节点；没记过就后台探一次（Worker 用 waitUntil，不阻塞本次 302），
 把最快的那个记 6 小时。书签在浏览器里探活后会把最快的节点随 /push 上报
 （by=client，最准）。
+
+首次请求是冷启动（要现场打 bilibili），最坏约 COLD_BUDGET_MS=9s；
+超时会返回 504 并在后台补签，直接重试即可命中缓存。
 
 说明：本服务只做「签名」，不中转视频流量，播放在你的播放器与 CDN 之间直连。
 链接有效期约 2 小时（bilibili 的 deadline）；过期请重新请求短链，不要转发 302 之后的直链。
@@ -218,6 +226,7 @@ export async function handle(req, opts = {}) {
     learn,
     client,
     waitUntil: opts.waitUntil || null,
+    coldBudgetMs: opts.coldBudgetMs || COLD_BUDGET_MS,
   };
 
   try {
@@ -238,8 +247,14 @@ export async function handle(req, opts = {}) {
       const key = `u:${bvid}:${page}:${qn}`;
       let hit = opts.cache ? await opts.cache.get(key) : null;
       if (!hit || !isFresh(hit)) {
-        hit = await resolveDirectUrl({ bvid, aid: null, p: page, qn }, fetchImpl);
-        if (opts.cache) await opts.cache.put(key, hit, ttlOf(hit));
+        hit = await resolveDirectUrl({ bvid, aid: null, p: page, qn }, fetchImpl, {
+          budgetMs: ctx.coldBudgetMs,
+        });
+        // timings 只是这次冷启动的诊断数据，不进缓存（否则下次读出来会误导）
+        if (opts.cache) {
+          const { timings, ...stored } = hit;
+          await opts.cache.put(key, stored, ttlOf(hit));
+        }
       }
       return await respond(hit, ctx);
     } catch (err) {
@@ -255,6 +270,12 @@ export async function handle(req, opts = {}) {
       throw err;
     }
   } catch (err) {
+    // 冷启动超时：先把结果留在后台继续签。客户端这次失败，但重试时能命中缓存，
+    // 不会出现「第一次慢到超时、第二次才成功」那种无解循环。
+    if (isColdTimeout(err) && ctx.bvid && typeof opts.waitUntil === 'function') {
+      const job = warmInBackground(ctx);
+      if (job) opts.waitUntil(job);
+    }
     if (err instanceof HttpError || err instanceof PushError) {
       return text(`${err.status} ${err.message}${err.detail ? '\n' + err.detail : ''}`, err.status);
     }
@@ -262,7 +283,33 @@ export async function handle(req, opts = {}) {
   }
 }
 
-/** 缓存读写都不应该弄挂请求 */
+const isColdTimeout = (err) =>
+  err instanceof HttpError &&
+  (err.status === 504 || /超时|timed out|timeout/i.test(String(err.message || '')));
+
+/**
+ * 冷路径超时后，用更宽的预算在后台把签名跑完并写进缓存（同一键 2 分钟内只跑一次）。
+ * 返回要交给 waitUntil 的 promise；已在补签中则返回 null。
+ */
+async function warmInBackground(ctx) {
+  const { bvid, page, qn, cache, fetchImpl } = ctx;
+  if (!cache || !bvid) return null;
+  const lockKey = `warm:${bvid}:${page}:${qn}`;
+  if (await safeGet(cache, lockKey)) return null;
+  await safePut(cache, lockKey, 1, 120);
+
+  return (async () => {
+    try {
+      const hit = await resolveDirectUrl({ bvid, aid: null, p: page, qn }, fetchImpl, {
+        budgetMs: WARM_BUDGET_MS,
+      });
+      const { timings, ...stored } = hit;
+      await safePut(cache, `u:${bvid}:${page}:${qn}`, stored, ttlOf(hit));
+    } catch {}
+  })();
+}
+
+
 async function safeGet(cache, key) {
   try {
     return await cache.get(key);
@@ -390,6 +437,8 @@ async function respond(hit, ctx) {
       'X-Bili-Page': String(page),
       'X-Bili-Cdn': picked.tag,
       'X-Bili-Cdn-Source': source,
+      // 冷启动耗时（仅现场解析时有），用来区分「上游慢」还是「CDN/网络慢」
+      ...(hit.timings ? { 'X-Bili-Upstream-Ms': String(hit.timings.totalMs) } : {}),
       ...(learning ? { 'X-Bili-Cdn-Learning': '1' } : {}),
       'X-Bili-Source': hit.fromPush ? 'push' : 'live',
       ...(hit.degraded ? { 'X-Bili-Degraded': '1' } : {}),
@@ -493,7 +542,13 @@ async function handleCacheView(raw, opts) {
 async function aidToBvid(aid, fetchImpl) {
   const res = await fetchImpl(
     `https://api.bilibili.com/x/web-interface/view?aid=${Number(aid)}`,
-    { headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' } }
+    {
+      headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.bilibili.com/' },
+      signal:
+        typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+          ? AbortSignal.timeout(3000)
+          : undefined,
+    }
   );
   const body = await res.json().catch(() => null);
   if (!body || body.code !== 0 || !body.data) {

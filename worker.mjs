@@ -67,6 +67,8 @@ export default {
       learn: !(env && env.CDN_LEARN === '0'),
       // 探测放到响应之后（Learners 用 waitUntil），别拖慢首次 302
       waitUntil: ctx && typeof ctx.waitUntil === 'function' ? (p) => ctx.waitUntil(p) : null,
+      // 冷启动回给客户端的预算；上游实在太慢可以调大（默认 9000ms）
+      coldBudgetMs: Number(env && env.COLD_BUDGET_MS) || undefined,
     });
   },
 };

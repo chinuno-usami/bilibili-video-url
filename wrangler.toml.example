@@ -34,3 +34,12 @@ compatibility_date = "2024-11-01"
 
 # 可选：关闭「按 ASN 自动探测最佳 CDN 节点」（默认开启）
 # CDN_LEARN = "0"
+
+# 冷启动（KV 未命中）回给客户端的总预算，默认 9000ms。
+# 如果上游 bilibili 从你的 Worker 出口很慢、但你愿意让播放器等，调大这个值：
+# COLD_BUDGET_MS = "15000"
+
+# 可选：让 Worker 尽量靠近源站（bilibili）而不是靠近用户。
+# 冷启动更快，但每次 302 的往返会远一点——本项目响应很小，通常值得。
+# [placement]
+# mode = "smart"
