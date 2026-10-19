@@ -150,23 +150,64 @@ function boot() {
       (d.bvid || t.bv || 'av' + t.av) +
       ' · 第 ' + d.p + ' P · ' + qnLabel(d.quality) + ' (qn=' + d.quality + ')' +
       (d.acceptQuality && d.acceptQuality.length ? ' · 可选 ' + d.acceptQuality.join('/') : '') +
+      (d.cdn ? ' · CDN ' + d.cdn + (d.cdnMs != null ? '(' + d.cdnMs + 'ms)' : '') : '') +
       (expires != null ? ' · 直链剩 ' + humanExpire(expires) : '') +
       (d.inPage ? ' · 页面内解析' : '');
     paint();
     return d;
   }
 
+  function cdnNote(d) {
+    if (!d.cdn) return '';
+    return '节点 ' + d.cdn + (d.cdnMs != null ? ' (' + d.cdnMs + 'ms)' : '');
+  }
+
+  function readyText(d, extra) {
+    return ['就绪', cdnNote(d), extra].filter(Boolean).join(' · ');
+  }
+
+  // 用访问者自己的网络挑 CDN 节点：服务端出口可能是机房/海外，它挑的节点
+  // 对联通/移动/境外不一定通。探活结果会随 /push 上报，服务端按 ASN 记住。
+  function chooseBest(d) {
+    var urls = d.urls && d.urls.length ? d.urls : cdnCandidates(d.url);
+    if (!urls || urls.length < 2) return Promise.resolve(d);
+    say('按你的网络挑最快的 CDN 节点…');
+    return probeInPage(urls)
+      .then(function (ranked) {
+        var best = (ranked || []).filter(function (r) {
+          return r.ok;
+        })[0];
+        if (best) {
+          d.cdn = best.tag;
+          d.cdnMs = best.ms;
+          d.url = best.url;
+          render(d);
+        } else {
+          say('所有节点都没探通，先按默认节点走');
+        }
+        return d;
+      })
+      .catch(function () {
+        return d;
+      });
+  }
+
   function serverless() {
     return resolveInPage(t, st.page, st.qn).then(function (d) {
       render(d);
-      return cacheToServer(d).then(function (r) {
-        say(
-          r.ok
-            ? '就绪 · 已缓存到服务端，VRChat 可直接用短链'
-            : '就绪（页面内解析）· 缓存到服务端失败：' + r.error,
-          r.ok ? 'k' : 'e'
-        );
-      });
+      return chooseBest(d)
+        .then(function () {
+          return cacheToServer(d);
+        })
+        .then(function (r) {
+          say(
+            readyText(
+              d,
+              r.ok ? '已缓存到服务端，VRChat 可直接用短链' : '缓存到服务端失败：' + r.error
+            ),
+            r.ok ? 'k' : 'e'
+          );
+        });
     });
   }
 
@@ -186,9 +227,11 @@ function boot() {
       })
       .then(function (d) {
         render(d);
-        // 服务端刚解析完，顺便让它自己缓存一份（它已经有结果了，不用再打上游）
-        return cacheToServer(d).then(function (r) {
-          say(r.ok ? '就绪 · 已缓存' : '就绪', r.ok ? 'k' : 'k');
+        // 先用访问者自己的网络挑节点，再把它连同直链一起 push 给服务端
+        return chooseBest(d).then(function () {
+          return cacheToServer(d).then(function (r) {
+            say(readyText(d, r.ok ? '已缓存' : ''), 'k');
+          });
         });
       })
       .catch(function (e) {

@@ -31,3 +31,6 @@ compatibility_date = "2024-11-01"
 # ── /push 保护（推荐）──
 # 用 secret 而不是写在这里：
 #   npx wrangler secret put PUSH_TOKEN
+
+# 可选：关闭「按 ASN 自动探测最佳 CDN 节点」（默认开启）
+# CDN_LEARN = "0"

@@ -51,14 +51,20 @@ const cacheApiCache =
 export default {
   /**
    * @param {Request} request
-   * @param {{BASE_PATH?: string, PUSH_TOKEN?: string, PUSH?: KVNamespace}} env
+   * @param {{BASE_PATH?: string, PUSH_TOKEN?: string, PUSH?: KVNamespace, CDN_LEARN?: string}} env
+   * @param {{waitUntil?: (p: Promise<any>) => void}} [ctx]
    */
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const cache = env && env.PUSH ? kvCache(env.PUSH) : cacheApiCache;
+    const cf = request.cf || {};
     return handle(request, {
       cache,
       basePath: (env && env.BASE_PATH) || '',
       pushToken: (env && env.PUSH_TOKEN) || '',
+      // 访问者的 ASN/国家/边缘节点：用来记住「这个运营商走哪个 CDN 最快」
+      client: { asn: cf.asn, country: cf.country, colo: cf.colo },
+      // CDN_LEARN=0 可关掉自动探测（只用手动 remember 下来的）
+      learn: !(env && env.CDN_LEARN === '0'),
     });
   },
 };

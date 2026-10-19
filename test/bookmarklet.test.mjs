@@ -89,12 +89,16 @@ test('buildInline: 展开后语法有效且带上 base', async () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const lib = await readFile(join(here, '..', 'src', 'bm-lib.mjs'), 'utf8');
   const ui = await readFile(join(here, '..', 'bookmarklet', 'bm-ui.js'), 'utf8');
-  const bm = buildInline(lib, ui, 'https://bili.example.com');
+  const cdn = await readFile(join(here, '..', 'src', 'cdn.mjs'), 'utf8');
+  const bm = buildInline(lib, ui, 'https://bili.example.com', '', cdn);
   const code = decodeURIComponent(bm.slice('javascript:'.length));
   assert.doesNotThrow(() => new Function(code));
   assert.ok(!code.includes('__BASE__'));
   assert.ok(code.includes('https://bili.example.com'));
   assert.ok(!/^export /m.test(code));
+  // 书签要自己探活，CDN 候选表必须被一起打包进来
+  assert.ok(code.includes('function probeInPage'));
+  assert.ok(code.includes('function cdnCandidates'));
 });
 
 test('jsonpUrl / biliApiPath', () => {

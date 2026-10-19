@@ -2,6 +2,7 @@
 // 只用匿名接口，不涉及任何账号 cookie；单文件 mp4（h264+aac），可直接喂给播放器。
 
 import { mixinKey, signQuery } from './wbi.mjs';
+import { cdnCandidates } from './cdn.mjs';
 
 export const BILI = 'https://api.bilibili.com';
 
@@ -18,6 +19,48 @@ const BROWSER_HEADERS = {
   Accept: 'application/json, text/plain, */*',
   'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
 };
+
+// CDN 候选表与选择逻辑在 cdn.mjs（书签脚本也要用同一份），这里只保留
+// 「服务端探活」——它会带浏览器 UA，因为 CDN 对 UA 有白名单。
+export { CDN_MIRRORS, cdnCandidates, cdnTagOf, selectCandidate } from './cdn.mjs';
+
+/**
+ * 从服务端（Worker 边缘 / 本机）探各候选是否可达：Range 1 字节。
+ * 注意：这不是访问者视角，只能用来区分「签名/防盗链问题」和「网络/节点问题」。
+ * 访问者的真实网络请用浏览器端 probeInPage。
+ */
+export async function probeCandidates(urls, fetchImpl = fetch, { timeoutMs = 3000 } = {}) {
+  const signal =
+    typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+      ? AbortSignal.timeout(timeoutMs)
+      : undefined;
+  const one = async (c) => {
+    const started = Date.now();
+    try {
+      const res = await fetchImpl(c.url, {
+        method: 'GET',
+        headers: { ...BROWSER_HEADERS, Range: 'bytes=0-0' },
+        signal,
+      });
+      const ms = Date.now() - started;
+      try {
+        if (res.body && res.body.cancel) await res.body.cancel();
+      } catch {}
+      return { tag: c.tag, host: c.host, status: res.status, ok: res.status === 200 || res.status === 206, ms };
+    } catch (err) {
+      return {
+        tag: c.tag,
+        host: c.host,
+        status: 0,
+        ok: false,
+        ms: Date.now() - started,
+        error: String((err && err.message) || err),
+      };
+    }
+  };
+  const all = await Promise.all(urls.map(one));
+  return all.sort((a, b) => Number(b.ok) - Number(a.ok) || a.ms - b.ms);
+}
 
 const BV_RE = /(BV[0-9A-Za-z]{10})/;
 const AV_RE = /(?:^|[^\w])av(\d{1,12})(?![\w])/i;
@@ -238,6 +281,7 @@ export async function resolveDirectUrl({ bvid, aid, p = 1, qn = 64 }, fetchImpl 
 
   return {
     url: direct,
+    urls: cdnCandidates(direct),
     quality: d.quality,
     acceptQuality: d.accept_quality || [],
     title: data.title,

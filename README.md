@@ -26,13 +26,18 @@ https://your.host/p/BV1GJ411x7h7?p=1&qn=64      ← 42 字符，可直接贴进 
 |---|---|
 | `/p/BV1GJ411x7h7` | 302 到直链，默认 `qn=64`（720P） |
 | `/p/BV1GJ411x7h7?p=2&qn=16` | 第 2P，360P（文件小 5 倍，加载快） |
+| `/p/BV1GJ411x7h7?h=ali` | 换 CDN 节点：`ali`/`cos`/`hw`/`08c`/`aliov`/`cosov`/`cn-ct`… |
+| `/p/BV1GJ411x7h7?i=2` | 按下标挑节点（`/json` 的 `urls` 顺序） |
+| `/p/BV1GJ411x7h7?h=hw&remember=1` | 挑节点并记到访问者的 ASN（Worker 部署） |
 | `/p/av80433022` | av 号 |
 | `/p/<urlencoded bilibili/b23.tv 链接>` | 自动展开短链 |
 | `/player/?url=BV1GJ411x7h7` | 兼容 91vrchat 的写法 |
-| `/json/BV1GJ411x7h7` | 调试用，返回 url / 标题 / 剩余有效期 |
+| `/json/BV1GJ411x7h7` | 调试用，返回 url / urls / 标题 / 剩余有效期 |
+| `/json/BV1GJ411x7h7?probe=1` | 额外逐个探测 CDN 候选节点是否可达（含耗时） |
+| `/cdn/4837` | 查看某个 ASN 记住的 CDN 节点（不带参数则看自己的） |
 | `/healthz` | 健康检查 |
 
-响应头会带上 `X-Bili-Bvid` / `X-Bili-Page` / `X-Bili-Quality`，方便排查。
+响应头会带上 `X-Bili-Bvid` / `X-Bili-Page` / `X-Bili-Quality` / `X-Bili-Cdn`，方便排查。
 
 ## 清晰度
 
@@ -163,8 +168,125 @@ node bookmarklet/build.mjs https://your.host     # 生成书签代码
 ### 测试
 
 ```bash
-npm test     # 35 个用例，全部用假 fetch，不联网
+npm test     # 44 个用例，全部用假 fetch，不联网
 ```
+
+## 「别人连不上」怎么办
+
+短链自己能用、别人打不开，通常是下面三种之一，按可能性排序：
+
+### 1. 节点是按「谁在请求」挑的
+
+playurl 返回的主机名来自请求方的 IP，例如 `cn-jsnt-ct-01-02.bilivideo.com`
+= 江苏南通电信。服务跑在机房/海外时，挑出来的节点对**联通/移动/别的省份/境外**
+的访问者可能很慢甚至不通。
+
+好消息：`upsig` 绑定的是路径 + 参数，**不锁主机名**。同一份签名换到镜像是通的
+（实测 `upos-sz-mirror{ali,cos,hw,08c,aliov,cosov}.bilivideo.com` 全部 206，
+只有 `*.akamaized.net` 因 `os/og` 家族不匹配会 403，已排除）。所以：
+
+```bash
+curl -sI 'https://your.host/p/BV1GJ411x7h7?qn=16&h=cosov'   # 境外/境外线路
+curl -s  'https://your.host/json/BV1GJ411x7h7?probe=1'       # 看哪个节点从边缘可达
+```
+
+`/json` 会返回完整候选列表：
+
+```json
+{ "cdn": "cn-ct", "url": "https://cn-...", "urls": [ {"tag":"cn-ct","host":"cn-...","primary":true}, {"tag":"ali","host":"upos-sz-mirrorali..."} ] }
+```
+
+VRChat 这类不能自带探测的客户端，可以把 `?h=` 固定写进贴出去的地址；浏览器/书签
+则可以逐个试（`Range: bytes=0-1` 探活），选最快的那个再 `/push`。
+
+### 1.1 按访问者 ASN 自动记忆（Worker 部署默认开启）
+
+Cloudflare 的 `request.cf.asn` 能拿到访问者所属运营商，于是节点选择可以「教会」：
+
+```
+GET /p/BV1x?qn=64
+  ├─ 有 ?h= / ?i=          → 听你的（带 remember=1 则记下来）      manual
+  ├─ KV 有 cdn:asn:<asn>   → 直接用记下的节点                    asn
+  ├─ 没记过 → 从边缘 colo 并行探 6 个候选（Range 1 字节）
+  │            → 记下最快的 6 小时                               probe
+  └─ 全部不可达 → 用上游原始节点，负缓存 15 分钟                  default
+```
+
+共有三种「教」的方式，都会写同一条 `cdn:asn:<asn>`：
+
+| 来源 | `by` | 说明 |
+|---|---|---|
+| `?h=xxx&remember=1` | `manual` | 人工指定，适合已知「联通必须走 hw」这类经验 |
+| 书签端探活 + `/push {cdn}` | `client` | **访问者自己的网络测出来的**，最准（见下） |
+| 边缘 colo 探测 | `probe` | 近似值；不依赖客户端，VRChat 也能受益 |
+
+### 1.2 Cloudflare 的出口 IP 能用来探测吗？
+
+能，但要分清两个完全不同的东西：
+
+| 打谁 | 谁在拦 | 拦的理由 |
+|---|---|---|
+| `api.bilibili.com`（view / playurl） | 风控 | 机房 IP、请求太频、UA 像爬虫 → `-412` / HTTP 412 |
+| `upos-*.bilivideo.com`（CDN 取流） | 防盗链 | 只看 `upsig`/`deadline` 和 UA 白名单，不查 IP 信誉 |
+
+所以 Worker 出口被风控 **不等于** 探测 CDN 也会被拦：探测打的是 CDN，而不是 API。
+不过我不能保证每个机房 IP 在 CDN 那边都畅通，所以实现上做了两层保险：
+
+1. **fail-open**：探测全失败 → 只写 15 分钟负缓存 → 回到上游给的节点。
+   跟没这个功能一样，**不会因为探测失败把可用链跳死**。
+2. **不把探测当唯一依据**：更准的是让访问者自己测。书签在浏览器里用
+   `fetch(no-cors)` 并发打各候选，拿到响应头就 abort（不真下视频），
+   把最快的 tag 随 `/push` 上报，服务端再按 **这次 POST 的 `cf.asn`** 记住：
+
+```
+书签（访问者网络）──探活──▶ 最快 = hw
+        │ POST /push { url, cdn: "hw" }
+        ▼
+Worker：校验 hw 是该直链的合法候选 → 写 cdn:asn:<访问者的 ASN> = { tag: hw, by: client }
+        ▼
+其他同 ASN 的 VRChat 请求 ──302──▶ upos-sz-mirrorhw...
+```
+
+- 上报的 `cdn` 必须是当前直链的合法候选 tag，否则忽略（防投毒／防开放跳转）
+- 书签跑在电脑上，`cf.asn` 是电脑的；同一个家庭网络的头显通常同 ASN，
+  走手机热点 / 公司网络时会不一样
+- 只信客户端、彻底关掉边缘探测：`CDN_LEARN = "0"`
+- 边缘探测仍有用：VRChat 自己没有「先探后播」的能力，冷启动那次得有人先教
+
+- 键：`cdn:asn:<asn>`（KV 或 Cache API），TTL 6 小时，之后重新学（运营商路由会变）
+- 成本：每个新 ASN 只多 6 个 1 字节请求 + 1 次 KV 写，之后零开销；视频流量仍然 0
+- 手动教一次：
+
+```bash
+curl -sI 'https://your.host/p/BV1GJ411x7h7?qn=16&h=hw&remember=1'  # 记下：该 ASN 走华为云
+curl -s  'https://your.host/cdn/4837'                              # 查看 ASN 4837 记了什么
+```
+
+想彻底关掉自动探测（只保留手动 `remember` 与客户端上报）：在 `wrangler.toml` 里加
+`CDN_LEARN = "0"`（默认开）。
+
+> 注意：同一 ASN 下所有用户共享一条记忆（运营商级粒度），个人网络差异不能区分。
+
+### 2. 直链 2 小时过期
+
+`/p/...` 短链永远有效（每次都现场重新签名），但 `302` 之后的直链会被
+`deadline` 卡死。**不要转发 `/json` 里的直链**，转发短链。
+
+### 3. 客户端 UA 被 CDN 拦
+
+CDN 只放行一部分 UA：`curl`、`VLC/3.x`、空 UA → 403（openresty 直接 403，跟
+Referer 无关）；浏览器、`mpv`、`stagefright`、`AppleCoreMedia` → 206。所以别人用
+`curl`/`wget`/某些播放器「验证」时看到 403，未必是链路问题：
+
+```bash
+# 对照测试：同一地址，换 UA 就变 206
+curl -s -o /dev/null -w '%{http_code}\n' -r 0-1023 "<直链>"                     # 403
+curl -s -o /dev/null -w '%{http_code}\n' -r 0-1023 -A 'Mozilla/5.0' "<直链>"    # 206
+```
+
+302 没法替客户端改 UA。如果对方播放器确实中招，只剩两条路：换播放器，或在边缘
+做一层带浏览器 UA 的 `Range` 中转（会消耗流量，与本项目「不中转」的定位相反，
+需要的话可以另加 `/proxy` 路由，默认不开）。
 
 ## 注意
 

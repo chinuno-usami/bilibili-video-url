@@ -12,6 +12,8 @@ export function pushPayload(d, t, page, qn) {
     title: d.title || '',
     acceptQuality: d.acceptQuality || [],
     url: d.url,
+    // 浏览器端探活选出的节点（服务端会把它记到当前访问者的 ASN 上）
+    cdn: d.cdn || null,
   };
 }
 

@@ -47,7 +47,14 @@ const server = createServer(async (req, res) => {
       headers: req.headers,
       body,
     });
-    const response = await handle(request, { cache, pushToken: PUSH_TOKEN });
+    // 本地调试「按 ASN 记忆节点」：curl -H 'X-Client-ASN: 4837' ...
+    // 生产（Worker）由 request.cf.asn 提供，这个头不会用到。
+    const asn = req.headers['x-client-asn'];
+    const response = await handle(request, {
+      cache,
+      pushToken: PUSH_TOKEN,
+      client: asn ? { asn, colo: 'local' } : null,
+    });
     res.writeHead(response.status, Object.fromEntries(response.headers));
     if (req.method === 'HEAD' || !response.body) {
       res.end();

@@ -266,3 +266,207 @@ test('GET /cache 能看到推送条目', async () => {
   assert.equal(body.pushed[0].qn, 16);
   assert.equal(body.pushed[0].fresh, true);
 });
+
+// ── CDN 候选（解决「别人连不上某个节点」）──────────────────
+
+test('cdnCandidates: 保留原节点，并把签名参数原样带到镜像', async () => {
+  const { cdnCandidates, selectCandidate, cdnTagOf } = await import('../src/bili.mjs');
+  const src =
+    'https://cn-jsnt-ct-01-02.bilivideo.com/upgcxcode/9/1/1-1-192.mp4?upsig=abc&deadline=9999999999&og=ali';
+  const list = cdnCandidates(src);
+  assert.ok(list.length > 1);
+  assert.equal(list[0].host, 'cn-jsnt-ct-01-02.bilivideo.com');
+  assert.equal(list[0].tag, 'cn-ct');
+  assert.equal(cdnTagOf('upos-sz-mirrorcosov.bilivideo.com'), 'cosov');
+  for (const c of list) {
+    const u = new URL(c.url);
+    assert.equal(u.searchParams.get('upsig'), 'abc');
+    assert.equal(u.searchParams.get('deadline'), '9999999999');
+    assert.match(u.pathname, /\/upgcxcode\//);
+  }
+  // akamai 会 403，不能进候选
+  assert.ok(!list.some((c) => /akamaized\.net$/.test(c.host)));
+
+  assert.equal(selectCandidate(list, { h: 'cosov' }).tag, 'cosov');
+  assert.equal(selectCandidate(list, { i: 1 }).tag, list[1].tag);
+  assert.equal(selectCandidate(list, {}).host, list[0].host);
+  assert.equal(selectCandidate(list, { h: 'nope' }).host, list[0].host);
+  assert.deepEqual(cdnCandidates('not a url'), []);
+});
+
+test('/p 支持 ?h= 换 CDN 节点，/json 列出全部候选', async () => {
+  const res = await handle(req('/p/BV1GJ411x7h7?h=cosov'), { fetchImpl: fakeFetch() });
+  assert.equal(res.status, 302);
+  assert.equal(res.headers.get('x-bili-cdn'), 'cosov');
+  assert.match(res.headers.get('location'), /upos-sz-mirrorcosov\.bilivideo\.com/);
+
+  const j = await (await handle(req('/json/BV1GJ411x7h7'), { fetchImpl: fakeFetch() })).json();
+  assert.ok(Array.isArray(j.urls) && j.urls.length > 1);
+  assert.equal(j.url, j.urls[0].url);
+  assert.equal(j.cdn, j.urls[0].tag);
+
+  // 推送缓存里的短链同样能换节点
+  const cache = memCache();
+  await handle(pushReq({ bvid: 'BV1GJ411x7h7', p: 1, qn: 16, url: mediaUrl(16) }), { cache });
+  const p = await handle(req('/p/BV1GJ411x7h7?qn=16&h=ali'), { cache });
+  assert.equal(p.status, 302);
+  assert.equal(p.headers.get('x-bili-cdn'), 'ali');
+});
+
+// ── 按访问者 ASN 记忆最佳节点 ─────────────────────────────
+
+/** 在 fakeFetch 外面套一层：媒体请求按 host 返回 206/403，用来模拟探测 */
+function cdnAwareFetch(okHosts) {
+  const base = fakeFetch();
+  const impl = async (url, init) => {
+    const u = new URL(url);
+    if (u.pathname.startsWith('/upgcxcode/')) {
+      impl.probes.push(u.host);
+      return new Response('x', { status: okHosts.includes(u.host) ? 206 : 403 });
+    }
+    return base(url, init);
+  };
+  impl.probes = [];
+  impl.calls = base.calls;
+  return impl;
+}
+
+test('首次访问探测并把可用节点记到该 ASN，之后不再探测', async () => {
+  const cache = memCache();
+  const ok = 'upos-sz-mirrorhw.bilivideo.com';
+  const f = cdnAwareFetch([ok]);
+  const opts = { cache, fetchImpl: f, client: { asn: 4837, country: 'CN', colo: 'HKG' } };
+
+  const r1 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  assert.equal(r1.status, 302);
+  assert.equal(r1.headers.get('x-bili-cdn'), 'hw');
+  assert.equal(r1.headers.get('x-bili-cdn-source'), 'probe');
+  assert.ok(f.probes.length > 1, '应该逐个探过候选');
+
+  const stored = cache.store.get('cdn:asn:4837');
+  assert.equal(stored.tag, 'hw');
+  assert.equal(stored.host, ok);
+  assert.equal(stored.by, 'probe');
+
+  // 第二次：命中记忆，不再发探测请求
+  const before = f.probes.length;
+  const r2 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  assert.equal(r2.headers.get('x-bili-cdn'), 'hw');
+  assert.equal(r2.headers.get('x-bili-cdn-source'), 'asn');
+  assert.equal(f.probes.length, before);
+
+  // 不同 ASN 各记各的
+  const r3 = await handle(req('/p/BV1GJ411x7h7?qn=16'), {
+    ...opts,
+    client: { asn: 9929 },
+  });
+  assert.equal(r3.headers.get('x-bili-cdn'), 'hw');
+  assert.equal(r3.headers.get('x-bili-cdn-source'), 'probe');
+});
+
+test('?h=&remember=1 手动教一次，该 ASN 后续都走这个节点', async () => {
+  const cache = memCache();
+  const opts = { cache, fetchImpl: fakeFetch(), client: { asn: 4847 } };
+
+  const r1 = await handle(req('/p/BV1GJ411x7h7?h=cosov&remember=1'), opts);
+  assert.equal(r1.headers.get('x-bili-cdn'), 'cosov');
+  assert.equal(r1.headers.get('x-bili-cdn-source'), 'manual');
+  assert.equal(cache.store.get('cdn:asn:4847').tag, 'cosov');
+  assert.equal(cache.store.get('cdn:asn:4847').by, 'manual');
+
+  const r2 = await handle(req('/p/BV1GJ411x7h7'), opts);
+  assert.equal(r2.headers.get('x-bili-cdn'), 'cosov');
+  assert.equal(r2.headers.get('x-bili-cdn-source'), 'asn');
+
+  // 不带 remember 的显式选择不改记忆
+  await handle(req('/p/BV1GJ411x7h7?h=ali'), opts);
+  assert.equal(cache.store.get('cdn:asn:4847').tag, 'cosov');
+});
+
+test('污染保护：记住的 tag 在当前候选里不存在时退回默认', async () => {
+  const cache = memCache();
+  cache.store.set('cdn:asn:4808', { tag: 'gone', host: 'x', at: 1, by: 'manual' });
+  const r = await handle(req('/p/BV1GJ411x7h7'), {
+    cache,
+    fetchImpl: fakeFetch(),
+    client: { asn: 4808 },
+    learn: false,
+  });
+  assert.equal(r.status, 302);
+  assert.equal(r.headers.get('x-bili-cdn-source'), 'default');
+});
+
+test('GET /cdn/<asn> 能看到记忆；无 ASN 环境不崩', async () => {
+  const cache = memCache();
+  cache.store.set('cdn:asn:4837', { tag: 'aliov', host: 'upos-sz-mirroraliov.bilivideo.com', at: 1, by: 'manual' });
+  const body = await (await handle(req('/cdn/4837'), { cache })).json();
+  assert.equal(body.asn, '4837');
+  assert.equal(body.entry.tag, 'aliov');
+
+  const none = await (await handle(req('/cdn'), { cache })).json();
+  assert.equal(none.asn, null);
+  assert.match(none.note, /ASN/);
+
+  // Node 环境（没有 client）下短链照常工作
+  const r = await handle(req('/p/BV1GJ411x7h7'), { fetchImpl: fakeFetch() });
+  assert.equal(r.headers.get('x-bili-cdn-source'), 'default');
+});
+
+test('全部候选都不可达：记 15 分钟负缓存，不反复探测', async () => {
+  const cache = memCache();
+  const f = cdnAwareFetch([]);
+  const opts = { cache, fetchImpl: f, client: { asn: 4134 } };
+
+  const r1 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  assert.equal(r1.status, 302);
+  assert.equal(r1.headers.get('x-bili-cdn-source'), 'default');
+  assert.equal(cache.store.get('cdn:asn:4134').by, 'probe-empty');
+
+  const before = f.probes.length;
+  const r2 = await handle(req('/p/BV1GJ411x7h7?qn=16'), opts);
+  assert.equal(r2.headers.get('x-bili-cdn-source'), 'default');
+  assert.equal(f.probes.length, before);
+});
+
+// ── 客户端（浏览器）自报节点：不依赖服务端出口 IP ─────────
+
+test('/push 带上 cdn 时，把它记到「推送者」的 ASN 上', async () => {
+  const cache = memCache();
+  const opts = { cache, client: { asn: 56040 } };
+
+  // 合法 tag
+  const r = await handle(
+    pushReq({ bvid: 'BV1GJ411x7h7', p: 1, qn: 16, url: mediaUrl(16), cdn: 'hw' }),
+    opts
+  );
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).learnedCdn, 'hw');
+  assert.equal(cache.store.get('cdn:asn:56040').tag, 'hw');
+  assert.equal(cache.store.get('cdn:asn:56040').by, 'client');
+
+  // 不在当前直链候选里的 tag 一律忽略
+  const r2 = await handle(
+    pushReq({ bvid: 'BV1GJ411x7h7', p: 1, qn: 16, url: mediaUrl(16), cdn: 'akamai' }),
+    opts
+  );
+  assert.equal(r2.status, 200);
+  assert.equal((await r2.json()).learnedCdn, undefined);
+  assert.equal(cache.store.get('cdn:asn:56040').tag, 'hw');
+});
+
+test('probeInPage: 按可达 + 快慢排序（浏览器端探活）', async () => {
+  const { probeInPage, cdnCandidates } = await import('../src/cdn.mjs');
+  const urls = cdnCandidates(mediaUrl(16));
+  const seen = [];
+  const fake = async (url, init) => {
+    seen.push({ host: new URL(url).host, mode: init.mode });
+    if (new URL(url).host.includes('mirrorhw')) throw new Error('net::ERR_CONNECTION_RESET');
+    // 浏览器里 no-cors 拿到的是 opaque response（status 0），这里造个等价的
+    return new Response('');
+  };
+  const ranked = await probeInPage(urls, { timeoutMs: 500, fetchImpl: fake });
+  assert.equal(ranked[0].ok, true);
+  assert.equal(ranked[ranked.length - 1].host, 'upos-sz-mirrorhw.bilivideo.com');
+  assert.equal(ranked[ranked.length - 1].ok, false);
+  assert.equal(seen[0].mode, 'no-cors'); // CDN 没有 CORS 头也要能探
+});

@@ -40,22 +40,25 @@ export function buildLoader(base) {
 }
 
 /** 内联版：把全部代码塞进书签 URL，不依赖 loader */
-export function buildInline(libSource, uiSource, base, pushSource) {
+export function buildInline(libSource, uiSource, base, pushSource, cdnSource) {
   const injected =
     'var BASE = ' + JSON.stringify(base.replace(/\/+$/, '')) + ';';
   const ui = uiSource.replace(/\/\/ >>>BASE[\s\S]*?\/\/ <<<BASE/, injected);
   const body =
+    stripExports(cdnSource || '') + '\n' +
     stripExports(libSource) + '\n' + stripExports(pushSource || '') + '\n' + ui;
   return 'javascript:' + encodeURIComponent('(function(){' + body + '})()');
 }
 
 export async function buildAll(base) {
+  const cdn = await readFile(join(root, 'src', 'cdn.mjs'), 'utf8');
   const lib = await readFile(join(root, 'src', 'bm-lib.mjs'), 'utf8');
   const push = await readFile(join(root, 'src', 'push.mjs'), 'utf8');
   const ui = await readFile(join(here, 'bm-ui.js'), 'utf8');
   const page = await readFile(join(here, 'bm.html'), 'utf8');
 
-  const script = stripExports(lib) + '\n' + stripExports(push) + '\n' + ui;
+  const script =
+    stripExports(cdn) + '\n' + stripExports(lib) + '\n' + stripExports(push) + '\n' + ui;
 
   await mkdir(join(root, 'public'), { recursive: true });
   await writeFile(join(root, 'public', 'bookmarklet.js'), script + '\n', 'utf8');
@@ -75,7 +78,7 @@ export async function buildAll(base) {
   return {
     loaderBytes: script.length,
     compactUrl: buildLoader(base).length,
-    inlineUrl: buildInline(lib, ui, base, push).length,
+    inlineUrl: buildInline(lib, ui, base, push, cdn).length,
   };
 }
 
